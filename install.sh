@@ -134,7 +134,8 @@ main() {
   printf '  - 数据目录为 %s（首次运行时自动创建）。\n' "$HOME/.oroio"
 
   if [ "$alias_added" -eq 1 ]; then
-    printf '  - 已在 %s 添加 alias，重新打开终端后可直接运行 droid。\n' "$rc_file"
+    printf '  - 已在 %s 添加 alias，执行以下命令立即生效:\n' "$rc_file"
+    printf '      source %s\n' "$rc_file"
   else
     printf '  - alias 已存在于 %s，跳过。\n' "$rc_file"
   fi
