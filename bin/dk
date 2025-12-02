@@ -1077,7 +1077,7 @@ cmd_serve() {
         old_pid=$(cat "$pid_file")
         if kill -0 "$old_pid" 2>/dev/null; then
           echo "服务已在运行 (PID: $old_pid)"
-          printf '\033[36m访问: http://localhost:%s\033[0m\n' "$port"
+          printf '访问: \033[36mhttp://localhost:%s\033[0m\n' "$port"
           return 0
         fi
         rm -f "$pid_file"
@@ -1112,7 +1112,7 @@ cmd_serve() {
 
       if kill -0 "$pid" 2>/dev/null; then
         echo "Web服务已启动 (PID: $pid)"
-        printf '\033[36m访问: http://localhost:%s\033[0m\n' "$port"
+        printf '访问: \033[36mhttp://localhost:%s\033[0m\n' "$port"
       else
         rm -f "$pid_file"
         die "启动失败，请检查日志: $log_file"
@@ -1142,7 +1142,7 @@ cmd_serve() {
         pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
           echo "服务运行中 (PID: $pid)"
-          printf '\033[36m访问: http://localhost:%s\033[0m\n' "$port"
+          printf '访问: \033[36mhttp://localhost:%s\033[0m\n' "$port"
           return 0
         fi
       fi
