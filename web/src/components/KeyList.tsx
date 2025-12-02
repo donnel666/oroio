@@ -110,7 +110,7 @@ export default function KeyList() {
   const [newKey, setNewKey] = useState('');
   const [adding, setAdding] = useState(false);
 
-  const loadData = useCallback(async (showRefreshing = false) => {
+  const loadData = useCallback(async (showRefreshing = false, autoRefresh = true) => {
     try {
       if (showRefreshing) setRefreshing(true);
       else setLoading(true);
@@ -123,6 +123,21 @@ export default function KeyList() {
       ]);
       
       const decryptedKeys = decryptKeys(encryptedData);
+      
+      // Auto-refresh if cache is empty and we have keys
+      if (autoRefresh && cache.size === 0 && decryptedKeys.length > 0) {
+        setRefreshing(true);
+        await refreshCache();
+        const newCache = await fetchCache();
+        const keyInfos: KeyInfo[] = decryptedKeys.map((key, idx) => ({
+          key,
+          index: idx + 1,
+          isCurrent: idx + 1 === currentIndex,
+          usage: newCache.get(idx) || null,
+        }));
+        setKeys(keyInfos);
+        return;
+      }
       
       const keyInfos: KeyInfo[] = decryptedKeys.map((key, idx) => ({
         key,
