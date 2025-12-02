@@ -47,8 +47,11 @@ fetch_component() {
   command -v curl >/dev/null 2>&1 || die "需要 curl 以下载 $name"
   make_tmpdir
   local dest="$DK_TMPDIR/$name"
+  local ts
+  ts=$(date +%s)
   printf '正在从 %s 下载 %s...\n' "$url" "$name"
-  curl -fsSL "$url" -o "$dest" || die "下载 $name 失败（检查网络或仓库分支是否存在）"
+  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "${url}?ts=${ts}" -o "$dest" \
+    || die "下载 $name 失败（检查网络或仓库分支是否存在）"
   chmod +x "$dest"
   printf -v "$out_var" '%s' "$dest"
 }
@@ -57,12 +60,17 @@ fetch_web_assets() {
   make_tmpdir
   WEB_DIR="$DK_TMPDIR/web"
   install -d "$WEB_DIR/assets"
-  
+
   local base="https://github.com/notdp/oroio/releases/download/web-dist"
+  local ts
+  ts=$(date +%s)
   printf '正在下载 web 资源...\n'
-  curl -fsSL "$base/index.html" -o "$WEB_DIR/index.html" || die "下载 index.html 失败"
-  curl -fsSL "$base/index.js" -o "$WEB_DIR/assets/index.js" || die "下载 index.js 失败"
-  curl -fsSL "$base/index.css" -o "$WEB_DIR/assets/index.css" || die "下载 index.css 失败"
+  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "${base}/index.html?ts=${ts}" \
+    -o "$WEB_DIR/index.html" || die "下载 index.html 失败"
+  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "${base}/index.js?ts=${ts}" \
+    -o "$WEB_DIR/assets/index.js" || die "下载 index.js 失败"
+  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "${base}/index.css?ts=${ts}" \
+    -o "$WEB_DIR/assets/index.css" || die "下载 index.css 失败"
 }
 
 locate_sources() {

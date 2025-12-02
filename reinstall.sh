@@ -38,9 +38,12 @@ fetch_script() {
   command -v curl >/dev/null 2>&1 || die "需要 curl 以下载 $name"
 
   local url="https://raw.githubusercontent.com/notdp/oroio/main/$name"
+  local ts
+  ts=$(date +%s)
   # 打印到 stderr，避免被命令替换捕获
   printf '正在从 %s 下载 %s...\n' "$url" "$name" >&2
-  curl -fsSL "$url" -o "$TMP_DIR/$name" || die "下载 $name 失败"
+  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "${url}?ts=${ts}" \
+    -o "$TMP_DIR/$name" || die "下载 $name 失败"
   chmod +x "$TMP_DIR/$name"
   echo "$TMP_DIR/$name"
 }
