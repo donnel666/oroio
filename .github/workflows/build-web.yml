@@ -28,10 +28,20 @@ jobs:
           npm ci
           npm run build
 
+      - name: Update tag
+        run: |
+          git tag -f web-dist
+          git push -f origin web-dist
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: web-dist
+          name: Web Dashboard Assets
+          body: |
+            Pre-built web assets for `dk serve`.
+            
+            These files are automatically downloaded during installation.
           files: |
             web/dist/index.html
             web/dist/assets/*
