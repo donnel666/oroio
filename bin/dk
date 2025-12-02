@@ -5,6 +5,19 @@ set -euo pipefail
 DKM_HOME="$HOME/.oroio"
 KEYS_FILE="$DKM_HOME/keys.tsv"   # 每行: key<TAB>label（label可为空）
 CURRENT_FILE="$DKM_HOME/current" # 保存当前key的行号（从1开始）
+DKM_CACHE_FILE="$DKM_HOME/list_cache.b64"
+
+# 可调优的 curl 限制，避免长时间等待慢/无效请求
+DKM_CURL_MAX_TIME="${DKM_CURL_MAX_TIME:-4}"        # 单请求超时（秒）
+DKM_CURL_CONNECT_TIMEOUT="${DKM_CURL_CONNECT_TIMEOUT:-2}" # 连接超时（秒）
+# 并发与缓存
+DKM_LIST_AUTO_MAX="${DKM_LIST_AUTO_MAX:-6}"        # 自动模式的最大并发上限
+DKM_LIST_JOBS="${DKM_LIST_JOBS:-0}"                # 0 表示自动 min(DKM_LIST_AUTO_MAX, key数)
+DKM_CACHE_TTL="${DKM_CACHE_TTL:-30}"                # list 结果缓存 TTL（秒，0 关闭）
+
+# 可调优的 curl 限制，避免长时间等待慢/无效请求
+DKM_CURL_MAX_TIME="${DKM_CURL_MAX_TIME:-4}"        # 单请求超时（秒）
+DKM_CURL_CONNECT_TIMEOUT="${DKM_CURL_CONNECT_TIMEOUT:-2}" # 连接超时（秒）
 
 usage() {
   cat <<'EOF'
@@ -40,6 +53,104 @@ mask_key() {
   fi
 }
 
+hash_keys_file() {
+  if command -v sha1sum >/dev/null 2>&1; then
+    sha1sum "$KEYS_FILE" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 1 "$KEYS_FILE" 2>/dev/null | awk '{print $1}'
+  else
+    md5 "$KEYS_FILE" 2>/dev/null | awk '{print $NF}'
+  fi
+}
+
+b64_decode() {
+  if command -v base64 >/dev/null 2>&1; then
+    if base64 --help 2>&1 | grep -q -- '--decode'; then
+      base64 --decode
+    else
+      base64 -D
+    fi
+  else
+    die "缺少 base64 命令"
+  fi
+}
+
+invalidate_cache() {
+  rm -f "$DKM_CACHE_FILE"
+}
+
+declare -a FETCH_INFOS
+
+fetch_all_infos() {
+  local n=${#KEYS[@]}
+  FETCH_INFOS=()
+  local jobs="$DKM_LIST_JOBS"
+  if (( jobs <= 0 || jobs > n )); then
+    local auto_max="$DKM_LIST_AUTO_MAX"
+    if (( auto_max < 1 )); then auto_max=6; fi
+    if (( n <= auto_max )); then jobs=$n; else jobs=$auto_max; fi
+  fi
+  local tmpdir; tmpdir=$(mktemp -d)
+  local -a pids=()
+  for idx in "${!KEYS[@]}"; do
+    {
+      IFS=$'\t' read -r key _ <<<"${KEYS[$idx]}"
+      fetch_usage "$key" >"$tmpdir/$idx"
+    } &
+    pids+=("$!")
+    if (( ${#pids[@]} >= jobs )); then
+      wait "${pids[0]}"
+      pids=(${pids[@]:1})
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid"; done
+  for idx in "${!KEYS[@]}"; do
+    FETCH_INFOS[$idx]=$(cat "$tmpdir/$idx")
+  done
+  rm -rf "$tmpdir"
+}
+
+cache_load_infos() {
+  local ttl="$DKM_CACHE_TTL"
+  (( ttl > 0 )) || return 1
+  [ -f "$DKM_CACHE_FILE" ] || return 1
+  local ts sig
+  ts=$(sed -n '1p' "$DKM_CACHE_FILE")
+  sig=$(sed -n '2p' "$DKM_CACHE_FILE")
+  local now; now=$(date +%s)
+  if [[ -z "$ts" || -z "$sig" ]]; then return 1; fi
+  if (( now - ts > ttl )); then return 1; fi
+  local cur_sig; cur_sig=$(hash_keys_file)
+  if [[ "$cur_sig" != "$sig" ]]; then return 1; fi
+  FETCH_INFOS=()
+  while IFS=$'\t' read -r idx b64; do
+    [ -z "$idx" ] && continue
+    FETCH_INFOS[$idx]=$(printf '%s' "$b64" | b64_decode)
+  done < <(tail -n +3 "$DKM_CACHE_FILE")
+  # 确保完整
+  if (( ${#FETCH_INFOS[@]} == ${#KEYS[@]} )); then
+    return 0
+  fi
+  return 1
+}
+
+cache_save_infos() {
+  local ttl="$DKM_CACHE_TTL"
+  (( ttl > 0 )) || return 0
+  local sig; sig=$(hash_keys_file)
+  local now; now=$(date +%s)
+  mkdir -p "$DKM_HOME"
+  {
+    printf '%s\n' "$now"
+    printf '%s\n' "$sig"
+    for idx in "${!FETCH_INFOS[@]}"; do
+      local encoded
+      encoded=$(printf '%s' "${FETCH_INFOS[$idx]}" | base64 | tr -d '\n')
+      printf '%s\t%s\n' "$idx" "$encoded"
+    done
+  } >"$DKM_CACHE_FILE"
+}
+
 load_keys() {
   mapfile -t KEYS < <(grep -v '^[[:space:]]*$' "$KEYS_FILE" || true)
 }
@@ -64,14 +175,27 @@ copy_to_clipboard() {
 
 fetch_usage() {
   local key="$1"
-  local resp
-  if ! resp=$(curl -sS -X GET 'https://app.factory.ai/api/organization/members/chat-usage' \
+  local resp http_status body
+  # 将 HTTP 状态码与 body 分开，非 200 直接标记为不可用（避免继续使用无效 key）
+  if ! resp=$(curl -sS --http1.1 --retry 0 \
+    --connect-timeout "$DKM_CURL_CONNECT_TIMEOUT" --max-time "$DKM_CURL_MAX_TIME" \
+    -w '\n%{http_code}' -X GET 'https://app.factory.ai/api/organization/members/chat-usage' \
     -H "Authorization: Bearer ${key}" \
     -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'); then
-    printf "BALANCE=\nBALANCE_NUM=\nTOTAL=\nUSED=\nEXPIRES=?\nEXPIRES_FULL=?\nEXPIRES_TS=\nRAW=curl_error\n"
+    printf "BALANCE=0\nBALANCE_NUM=0\nTOTAL=0\nUSED=0\nEXPIRES=?\nEXPIRES_FULL=?\nEXPIRES_TS=\nRAW=curl_error\n"
     return
   fi
-  if ! printf "%s" "$resp" | jq -r '
+
+  http_status=${resp##*$'\n'}
+  body=${resp%$'\n'*}
+  [[ "$http_status" =~ ^[0-9]{3}$ ]] || http_status=000
+
+  if [ "$http_status" != "200" ]; then
+    printf "BALANCE=0\nBALANCE_NUM=0\nTOTAL=0\nUSED=0\nEXPIRES=Invalid key\nEXPIRES_FULL=Invalid key\nEXPIRES_TS=\nRAW=http_%s\n" "$http_status"
+    return
+  fi
+
+  if ! printf "%s" "$body" | jq -r '
     def n(v): if v==null then "" else (v|tostring) end;
     def tot(s): if s==null then null else (s.totalAllowance // s.basicAllowance // s.allowance // null) end;
     def used(s): if s==null then null else (s.orgTotalTokensUsed // s.used // s.tokensUsed // 0) end;
@@ -100,7 +224,7 @@ fetch_usage() {
     | map("\(.key)=\(n(.value))")
     | .[]
   '; then
-    printf "BALANCE=\nBALANCE_NUM=\nTOTAL=\nUSED=\nEXPIRES=?\nEXPIRES_FULL=?\nEXPIRES_TS=\nRAW=jq_error\n"
+    printf "BALANCE=0\nBALANCE_NUM=0\nTOTAL=0\nUSED=0\nEXPIRES=?\nEXPIRES_FULL=?\nEXPIRES_TS=\nRAW=jq_error\n"
   fi
 }
 
@@ -373,32 +497,55 @@ auto_rotate_if_needed() {
   [ $n -gt 0 ] || die "暂无key，请先添加。"
   local cur=$(current_index)
   (( cur<=n )) || cur=1
-  local checked=0
-  while (( checked < n )); do
-    IFS=$'\t' read -r key _ <<<"${KEYS[$((cur-1))]}"
-    info=$(fetch_usage "$key")
-    local balnum total used
+
+  # 先尝试用缓存；无缓存则并发获取并写缓存
+  if ! cache_load_infos; then
+    fetch_all_infos
+    cache_save_infos
+  fi
+
+  local info balnum total used raw remain
+
+  check_entry() {
+    local idx0="$1" # 0-based
+    info="${FETCH_INFOS[$idx0]}"
+    balnum="" total="" used="" raw=""
     while IFS='=' read -r k v; do
       case "$k" in
         BALANCE_NUM) balnum="$v";;
         TOTAL) total="$v";;
         USED) used="$v";;
+        RAW) raw="$v";;
       esac
     done <<<"$info"
-    local remain
+
+    if [[ "$raw" == http_* || "$raw" == curl_error || "$raw" == jq_error ]]; then
+      return 1
+    fi
     remain=$(calc_remain "$balnum" "$total" "$used")
     if [[ -z "$remain" ]]; then
-      set_current "$cur"
+      return 1
+    fi
+    awk -v r="$remain" 'BEGIN{exit !(r>0)}'
+  }
+
+  local cur0=$((cur-1))
+  if check_entry "$cur0"; then
+    set_current "$cur"
+    return
+  fi
+
+  # 当前不可用，遍历其余
+  local i
+  for ((i=1; i<n; i++)); do
+    local idx0=$(( (cur0 + i) % n ))
+    if check_entry "$idx0"; then
+      set_current $((idx0+1))
       return
     fi
-    if awk -v r="$remain" 'BEGIN{exit !(r>0)}'; then
-      set_current "$cur"
-      return
-    fi
-    cur=$((cur % n + 1))
-    ((checked++))
   done
-  die "所有key余额都为0，请添加新key。"
+
+  die "所有key余额都为0或不可用，请添加新key。"
 }
 
 cmd_add() {
@@ -426,6 +573,7 @@ cmd_add() {
       echo -e "${k}\t" >>"$KEYS_FILE"
     done
   fi
+  invalidate_cache
   echo "已添加。当前共有 $(grep -cv '^[[:space:]]*$' "$KEYS_FILE") 个key。"
 }
 
@@ -433,6 +581,13 @@ cmd_list() {
   ensure_store
   load_keys
   if [ ${#KEYS[@]} -eq 0 ]; then echo "暂无key，使用 'dk add' 添加。"; return; fi
+  local use_cache=0
+  if cache_load_infos; then
+    use_cache=1
+  else
+    fetch_all_infos
+    cache_save_infos
+  fi
   local cur cols
   cur=$(current_index)
   cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}
@@ -462,14 +617,18 @@ cmd_list() {
   fi
 
   # 预渲染数据（避免重复请求）；使用全局统一的进度条长度保证用量对齐
-  local -a ROW_NO ROW_KEY ROW_EXP USAGE_TXT BALNUM_ARR TOTAL_ARR REMAIN_ARR
+  local -a ROW_NO ROW_KEY ROW_EXP USAGE_TXT BALNUM_ARR TOTAL_ARR REMAIN_ARR RAW_ARR
   local i=0 max_usage_len=0
   for line in "${KEYS[@]}"; do
     ((++i))
     IFS=$'\t' read -r key label <<<"$line"
     label=${label:-}
-    info=$(fetch_usage "$key")
-    local bal balnum total used exp exp_full
+    if (( use_cache )); then
+      info="${FETCH_INFOS[$((i-1))]}"
+    else
+      info="${FETCH_INFOS[$((i-1))]}"
+    fi
+    local bal balnum total used exp exp_full raw
     while IFS='=' read -r k v; do
       case "$k" in
         BALANCE) bal="$v";;
@@ -478,18 +637,36 @@ cmd_list() {
         USED) used="$v";;
         EXPIRES) exp="$v";;
         EXPIRES_FULL) exp_full="$v";;
+        RAW) raw="$v";;
       esac
     done <<<"$info"
 
     remain=$(calc_remain "$balnum" "$total" "$used")
     local display_usage
     display_usage=$(render_usage_text "$used" "$total" "$balnum")
+    if [[ "$raw" == http_* ]]; then
+      display_usage="0/0"
+    fi
     (( ${#display_usage} > max_usage_len )) && max_usage_len=${#display_usage}
 
-    local key_disp marker row_key row_exp
+    local key_disp marker row_key row_exp alert=0
     key_disp=$(mask_key "$key")
     marker=$([ "$i" -eq "$cur" ] && echo "$(color_cyan "▶") " || echo "  ")
-    row_key="${marker}${key_disp}"
+
+    # 余额<=0 或低于10% 或 HTTP 非200 均标红（仅 Key 列）
+    if [[ "$raw" == http_* ]]; then
+      alert=1
+    elif is_low_remain "$remain" "$total"; then
+      alert=1
+    elif is_num "$remain" && awk -v r="$remain" 'BEGIN{exit !(r<=0)}'; then
+      alert=1
+    fi
+
+    if (( alert )); then
+      row_key="${marker}$(color_red "$key_disp")"
+    else
+      row_key="${marker}${key_disp}"
+    fi
 
     row_exp="${exp:-?}"; [ "${row_exp,,}" = "null" ] && row_exp="?"
 
@@ -500,6 +677,7 @@ cmd_list() {
     BALNUM_ARR+=("$balnum")
     TOTAL_ARR+=("$total")
     REMAIN_ARR+=("$remain")
+    RAW_ARR+=("$raw")
   done
 
   # 全局统一的进度条长度，确保用量数字纵向对齐
@@ -509,17 +687,19 @@ cmd_list() {
   # 生成最终行的用量文本
   local -a ROW_USAGE
   for ((i=0; i<${#KEYS[@]}; i++)); do
-    local bar usage_txt remain total balnum
+    local bar usage_txt remain total balnum raw
     usage_txt="${USAGE_TXT[$i]}"
     balnum="${BALNUM_ARR[$i]}"
     total="${TOTAL_ARR[$i]}"
     remain="${REMAIN_ARR[$i]}"
+    raw="${RAW_ARR[$i]}"
+
     bar=$(render_bar "$balnum" "$total" "$bar_len_global")
-    if is_low_remain "$remain" "$total"; then
-      ROW_USAGE+=( "$(color_red "$bar") $(color_red "$usage_txt")" )
-    else
-      ROW_USAGE+=( "${bar} ${usage_txt}" )
+    if [[ "$raw" == http_* ]]; then
+      usage_txt="0/0"
     fi
+
+    ROW_USAGE+=( "${bar} ${usage_txt}" )
   done
 
   local h1 h2 h3 h4
@@ -577,7 +757,7 @@ cmd_current() {
   if (( cur > ${#KEYS[@]} )); then cur=1; fi
   IFS=$'\t' read -r key label <<<"${KEYS[$((cur-1))]}"
   info=$(fetch_usage "$key")
-  local bal exp exp_full balnum total used
+  local bal exp exp_full balnum total used raw alert=0
   while IFS='=' read -r k v; do
     case "$k" in
       BALANCE) bal="$v";;
@@ -586,6 +766,7 @@ cmd_current() {
       USED) used="$v";;
       EXPIRES) exp="$v";;
       EXPIRES_FULL) exp_full="$v";;
+      RAW) raw="$v";;
     esac
   done <<<"$info"
   local label_w=8
@@ -599,6 +780,12 @@ cmd_current() {
 
   local usage_text
   usage_text=$(render_usage_text "$used" "$total" "$balnum")
+  if [[ "$raw" == http_* ]]; then
+    usage_text="0/0"
+  fi
+
+  local remain
+  remain=$(calc_remain "$balnum" "$total" "$used")
   # compute bar length based on available value width and usage text length
   local usage_text_len=$((1 + ${#usage_text})) # space + text
   # bar includes [] (2 chars), make string fit value_w
@@ -620,6 +807,18 @@ cmd_current() {
     exp_display="${exp_full:-${exp:-?}}"
   fi
 
+  if [[ "$raw" == http_* ]]; then
+    exp_display="Invalid key"
+  fi
+
+  if [[ "$raw" == http_* ]]; then
+    alert=1
+  elif is_low_remain "$remain" "$total"; then
+    alert=1
+  elif is_num "$remain" && awk -v r="$remain" 'BEGIN{exit !(r<=0)}'; then
+    alert=1
+  fi
+
   local border_char top_left top_right vert horiz
   border_char="─"
   top_left="┌"; top_right="┐"; vert="│"; horiz="─"
@@ -631,9 +830,14 @@ cmd_current() {
     "$(printf '%*s' $((value_w+2)) '' | tr ' ' "$horiz")" \
     "$top_right")
 
+  local key_display="$key"
+  if (( alert )); then
+    key_display=$(color_red "$key")
+  fi
+
   printf "%s\n" "$border"
   printf "│ %-*s │ %-*s │\n" "$label_w" "No"    "$value_w" "$cur"
-  printf "│ %-*s │ %-*s │\n" "$label_w" "Key"   "$value_w" "$key"
+  printf "│ %-*s │ %-*s │\n" "$label_w" "Key"   "$value_w" "$key_display"
   printf "│ %-*s │ %-*s │\n" "$label_w" "Usage" "$value_w" "$bar $usage_text"
   printf "│ %-*s │ %-*s │\n" "$label_w" "Expiry" "$value_w" "$exp_display"
   printf "└%s┴%s┘\n" \
@@ -656,6 +860,10 @@ cmd_use() {
   if [ $# -eq 0 ]; then
     local n=${#KEYS[@]}
     [ $n -gt 0 ] || die "暂无key"
+    if ! cache_load_infos; then
+      fetch_all_infos
+      cache_save_infos
+    fi
     local cur; cur=$(current_index)
     local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}
     local keyw=20 progw=34 min_key=14 min_prog=26 expw=12
@@ -676,30 +884,43 @@ cmd_use() {
     fi
 
     local -a opts=()
-    local -a USAGE_TXT BALNUM_ARR TOTAL_ARR REMAIN_ARR EXP_ARR KEY_DISP_ARR
+    local -a USAGE_TXT BALNUM_ARR TOTAL_ARR REMAIN_ARR EXP_ARR KEY_DISP_ARR RAW_ARR ALERT_KEY
     local i=0 max_usage_len=0
 
     # 第一次遍历：收集数据并求最大用量文本长度
     for line in "${KEYS[@]}"; do
       ((++i))
       IFS=$'\t' read -r key label <<<"$line"
-      info=$(fetch_usage "$key")
-      local balnum total used exp
+      info="${FETCH_INFOS[$((i-1))]}"
+      local balnum total used exp raw
       while IFS='=' read -r k v; do
         case "$k" in
           BALANCE_NUM) balnum="$v";;
           TOTAL) total="$v";;
           USED) used="$v";;
           EXPIRES) exp="$v";;
+          RAW) raw="$v";;
         esac
       done <<<"$info"
 
-      local remain display_usage key_disp exp_display
+      local remain display_usage key_disp exp_display alert=0
       remain=$(calc_remain "$balnum" "$total" "$used")
       display_usage=$(render_usage_text "$used" "$total" "$balnum")
+      if [[ "$raw" == http_* ]]; then
+        display_usage="0/0"
+      fi
       (( ${#display_usage} > max_usage_len )) && max_usage_len=${#display_usage}
 
       key_disp=$(mask_key "$key")
+
+      if [[ "$raw" == http_* ]]; then
+        alert=1
+      elif is_low_remain "$remain" "$total"; then
+        alert=1
+      elif is_num "$remain" && awk -v r="$remain" 'BEGIN{exit !(r<=0)}'; then
+        alert=1
+      fi
+
       key_disp=$(clip_pad "$key_disp" "$keyw")
       exp_display="${exp:-?}"; [ "${exp_display,,}" = "null" ] && exp_display="?"
 
@@ -709,6 +930,8 @@ cmd_use() {
       REMAIN_ARR+=("$remain")
       EXP_ARR+=("$exp_display")
       KEY_DISP_ARR+=("$key_disp")
+      RAW_ARR+=("$raw")
+      ALERT_KEY+=("$alert")
     done
 
     # 统一进度条长度，保证用量数字列对齐
@@ -717,15 +940,16 @@ cmd_use() {
 
     # 第二次遍历：渲染选项
     for ((idx=0; idx<${#KEYS[@]}; idx++)); do
-      local bar display_usage remain total balnum usage_disp exp_disp key_cell
+      local bar display_usage remain total balnum usage_disp exp_disp key_cell raw alert
       display_usage="${USAGE_TXT[$idx]}"
       balnum="${BALNUM_ARR[$idx]}"
       total="${TOTAL_ARR[$idx]}"
       remain="${REMAIN_ARR[$idx]}"
+      raw="${RAW_ARR[$idx]}"
+      alert="${ALERT_KEY[$idx]}"
       bar=$(render_bar "$balnum" "$total" "$bar_len")
-      if is_low_remain "$remain" "$total"; then
-        bar=$(color_red "$bar")
-        display_usage=$(color_red "$display_usage")
+      if [[ "$raw" == http_* ]]; then
+        display_usage="0/0"
       fi
 
       usage_disp=$(pad_cell "${bar} ${display_usage}" "$progw")
@@ -768,43 +992,6 @@ cmd_use() {
   echo "已切换到序号 $idx ($(mask_key "$(echo "${KEYS[$((idx-1))]}" | cut -f1)") )"
 }
 
-cmd_rotate() {
-  ensure_store
-  load_keys
-  [ ${#KEYS[@]} -gt 0 ] || die "暂无key"
-  local cur=$(current_index)
-  (( cur <= ${#KEYS[@]} )) || cur=1
-  local start=$cur
-  local tried=0
-  while :; do
-    IFS=$'\t' read -r key label <<<"${KEYS[$((cur-1))]}"
-    info=$(fetch_usage "$key")
-    local balnum bal
-    while IFS='=' read -r k v; do
-      case "$k" in
-        BALANCE_NUM) balnum="$v";;
-        BALANCE) bal="$v";;
-      esac
-    done <<<"$info"
-    if [ -z "$balnum" ] || [ "$balnum" = "None" ]; then
-      echo "序号 $cur 余额未知，默认可用。保持当前。"
-      set_current "$cur"
-      return
-    fi
-    if (( $(printf "%.0f" "$balnum") > 0 )); then
-      echo "序号 $cur 余额 > 0，保持当前。余额: $bal"
-      set_current "$cur"
-      return
-    fi
-    echo "序号 $cur 余额为0，尝试下一个。"
-    cur=$((cur % ${#KEYS[@]} + 1))
-    (( tried+=1 ))
-    if (( tried >= ${#KEYS[@]} )); then
-      die "所有key余额都为0，请添加新key。"
-    fi
-  done
-}
-
 cmd_run() {
   ensure_store
   auto_rotate_if_needed
@@ -836,6 +1023,7 @@ cmd_rm() {
   save_keys
   echo "已删除，剩余 ${#KEYS[@]} 个key。"
   set_current 1
+  invalidate_cache
 }
 
 cmd_reinstall() {
@@ -871,7 +1059,6 @@ main() {
     list|ls) cmd_list "$@";;
     current) cmd_current "$@";;
     use) cmd_use "$@";;
-    rotate) cmd_rotate "$@";;
     run) cmd_run "$@";;
     rm|remove|del) cmd_rm "$@";;
     uninstall) cmd_uninstall "$@";;
